@@ -41,5 +41,5 @@ Implement rate-limiting on all of the API endpoints. Do not use an off-the-shelf
 ### 2a - Front-end Track
 
 Can be found here:- 
-[`ws-product-frontend`](https://github.com/EQWorks/ws-product-nodejs)
+[`ws-product-frontend`](https://github.com/jan-far/ws-product-ui)
 
