@@ -1,93 +1,80 @@
-const moment = require('moment');
 const redis = require('redis');
 
 const redisClient = redis.createClient();
-const WINDOW_SIZE_IN_HOURS = 24;
-const MAX_WINDOW_REQUEST_COUNT = 100;
-const WINDOW_LOG_INTERVAL_IN_HOURS = 1;
+const resetHour = 24;
+const resetHourInSeconds = resetHour * 3600;
+const maxRequest = 100;
+let hashGroup;
+
+const setClient = (ip, updateInfo) => {
+  const timestamp = Math.floor(Number(new Date()) / 1000);
+  const Info = { timeStamp: timestamp, token: 0 };
+
+  const clientInfo = updateInfo
+    ? JSON.stringify({ ...Info, ...updateInfo })
+    : JSON.stringify(Info);
+
+  /*
+  Using hashGroup as hash key, which is of format 0.0.0 of the ip address
+  so that ip addresses can be hashed in groups and be memory efficient with large data
+  E.g 
+    hashGroup 10.20.10, will contain...
+    ip in the range 10.20.10.0 - 10.20.10.255
+  */
+  const setClientInfo = redisClient.hset(hashGroup, ip, clientInfo);
+
+  return setClientInfo;
+};
 
 const RateLimiter = (req, res, next) => {
-  try {
-    // check that redis client exists
-    if (!redisClient) {
-      throw new Error('Redis client does not exist!');
-      // process.exit(1);
+  const ip = req.ip;
+  const ipGroup = new RegExp(/((\d*)\.){2}((\d*))/, 'g');
+
+  // Redis Hash key which the ip can be found/set
+  hashGroup = ipGroup.exec(ip)[0];
+
+  redisClient.hget(hashGroup, ip, (err, record) => {
+    if (err) throw err;
+
+    if (record == null) {
+      setClient(ip);
+      return next();
     }
 
-    // fetch records of current user using IP address, returns null when no record is found
-    redisClient.get(req.ip, (err, record) => {
-      if (err) throw err;
-      const currentRequestTime = new moment();
-      // console.log(record);
+    const data = JSON.parse(record);
 
-      //  if no record is found , create a new record for user and store to redis
-      if (record == null) {
-        let newRecord = [];
-        let requestLog = {
-          requestTimeStamp: currentRequestTime.unix(),
-          requestCount: 1,
-        };
-        newRecord.push(requestLog);
-        redisClient.set(req.ip, JSON.stringify(newRecord));
-        return next();
-      }
+    // get the current time in seconds
+    const currentTimeInSeconds = Math.floor(Number(new Date()) / 1000);
+    // delete ClientHash in 24 hours time
+    const expireTime = data.timeStamp + resetHourInSeconds;
+    // increase the client's token by 1
+    const tokenCount = data.token + 1;
 
-      // if record is found, parse it's value and calculate number of requests users has made within the last window
-      let data = JSON.parse(record);
-      let windowStartTimestamp = moment()
-        .subtract(WINDOW_SIZE_IN_HOURS, 'hours')
-        .unix();
-
-      let requestsWithinWindow = data.filter((entry, i) => {
-        // Remove records more than 24hours
-        if (entry.requestTimeStamp < windowStartTimestamp) {
-          data.splice(i,1)
-        }
-        return entry.requestTimeStamp > windowStartTimestamp;
-      });
-      // console.log('requestsWithinWindow', requestsWithinWindow);
-
-      let totalWindowRequestsCount = requestsWithinWindow.reduce(
-        (accumulator, entry) => {
-          return accumulator + entry.requestCount;
-        },
-        0
-      );
-      console.log(totalWindowRequestsCount)
-
-      // if number of requests made is greater than or equal to the desired maximum, return error
-      if (totalWindowRequestsCount >= MAX_WINDOW_REQUEST_COUNT) {
-        res.status(429).send({
-          message: `You have exceeded the ${MAX_WINDOW_REQUEST_COUNT} requests in ${WINDOW_SIZE_IN_HOURS} hrs limit!`,
+    if (currentTimeInSeconds > expireTime) {
+      // delete client old session
+      redisClient.hdel(hashGroup, ip);
+      //  create new session
+      setClient(ip);
+      next();
+    } else {
+      if (tokenCount >= maxRequest) {
+        return res.status(429).send({
+          message: `You have exceeded the ${maxRequest} requests in ${resetHour} hrs limit!`,
         });
-      } else {
-        // if number of requests made is less than allowed maximum, log new entry
-        let lastRequestLog = data[data.length - 1];
-        let potentialCurrentWindowIntervalStartTimeStamp = currentRequestTime
-          .subtract(WINDOW_LOG_INTERVAL_IN_HOURS, 'hours')
-          .unix();
-
-        //  if interval has not passed since last request log, increment counter
-        if (
-          lastRequestLog.requestTimeStamp >
-          potentialCurrentWindowIntervalStartTimeStamp
-        ) {
-          lastRequestLog.requestCount++;
-          data[data.length - 1] = lastRequestLog;
-        } else {
-          //  if interval has passed, log new entry for current user and timestamp
-          data.push({
-            requestTimeStamp: currentRequestTime.unix(),
-            requestCount: 1,
-          });
-        }
-        redisClient.set(req.ip, JSON.stringify(data));
-        next();
       }
-    });
-  } catch (error) {
-    next(error);
-  }
+
+      // get initialTimestamp of client data
+      const clientInitialTimestamp = data.timeStamp;
+      // Update the token info
+      const updatedInfo = {
+        timeStamp: clientInitialTimestamp,
+        token: tokenCount,
+      };
+      // setClient with the updated info
+      setClient(ip, updatedInfo);
+      next();
+    }
+  });
 };
 
 module.exports = { RateLimiter };
